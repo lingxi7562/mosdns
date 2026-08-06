@@ -42,7 +42,7 @@ jobs:
           CGO_ENABLED: '0'
           GOOS: linux
           GOARCH: arm
-          GOARM: '7'
+          GOARM: '5'   # ZX279128S 无 VFP/NEON，必须软浮点
         run: |
           mkdir -p dist
           go build \
