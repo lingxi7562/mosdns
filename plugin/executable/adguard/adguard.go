@@ -85,7 +85,10 @@ type AdguardRule struct {
 	onlineRules  map[string]*OnlineRule
 	allowMatcher *domain.MixMatcher[struct{}]
 	denyMatcher  *domain.MixMatcher[struct{}]
-	httpClient   *http.Client
+	// cachedDenyRules 缓存最近一次 reload 解析出的黑名单规则串（mosdns 格式），
+	// 供 GetRules 直接返回，避免每次 domain_mapper rebuild 时重复解析文件（102K 条）。
+	cachedDenyRules []string
+	httpClient     *http.Client
 	reloadID     atomic.Uint64
 
 	// 用于优雅关闭
@@ -121,6 +124,20 @@ type noOpCollector struct{}
 
 func (c *noOpCollector) Add(_ string, _ struct{}) error { return nil }
 
+// dualCollector 同时写入 matcher 和 collector，用于一次解析同时构建 matcher 和收集规则串
+type dualCollector struct {
+	matcher   RuleReceiver
+	collector *ruleCollector
+}
+
+func (c dualCollector) Add(s string, v struct{}) error {
+	if err := c.matcher.Add(s, v); err != nil {
+		return err
+	}
+	c.collector.Add(s, v)
+	return nil
+}
+
 // Subscribe 实现 RuleExporter，允许 external plugin 监听变更
 func (p *AdguardRule) Subscribe(cb func()) {
 	p.subsMu.Lock()
@@ -132,6 +149,13 @@ func (p *AdguardRule) Subscribe(cb func()) {
 // 注意：只导出 Deny (黑名单) 规则，忽略 Allow (白名单) 规则。
 func (p *AdguardRule) GetRules() ([]string, error) {
 	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	// [内存优化] 优先返回 reload 时缓存的规则串，避免重复解析文件（102K 条 × 正则编译）
+	if p.cachedDenyRules != nil {
+		return p.cachedDenyRules, nil
+	}
+
 	// 获取所有“已启用”的规则
 	enabledRules := make([]*OnlineRule, 0)
 	for _, rule := range p.onlineRules {
@@ -139,7 +163,6 @@ func (p *AdguardRule) GetRules() ([]string, error) {
 			enabledRules = append(enabledRules, rule)
 		}
 	}
-	p.mu.RUnlock()
 
 	// 收集黑名单规则
 	denyCollector := &ruleCollector{rules: make([]string, 0)}
@@ -158,6 +181,7 @@ func (p *AdguardRule) GetRules() ([]string, error) {
 		file.Close()
 	}
 
+	p.cachedDenyRules = denyCollector.rules
 	return denyCollector.rules, nil
 }
 
@@ -283,12 +307,21 @@ func (p *AdguardRule) Match(domainStr string) (value struct{}, ok bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	if _, matched := p.allowMatcher.Match(domainStr); matched {
+	// reload 窗口期间 matcher 可能为 nil，此时视为不匹配（安全降级）
+	if p.allowMatcher == nil && p.denyMatcher == nil {
 		return struct{}{}, false
 	}
 
-	if _, matched := p.denyMatcher.Match(domainStr); matched {
-		return struct{}{}, true
+	if p.allowMatcher != nil {
+		if _, matched := p.allowMatcher.Match(domainStr); matched {
+			return struct{}{}, false
+		}
+	}
+
+	if p.denyMatcher != nil {
+		if _, matched := p.denyMatcher.Match(domainStr); matched {
+			return struct{}{}, true
+		}
 	}
 
 	return struct{}{}, false
@@ -390,9 +423,19 @@ func (p *AdguardRule) reloadAllRules(ctx context.Context, initialLoad bool) {
 
 	p.updateAllRuleCounts()
 
+	// [内存优化] 构建新 matcher 前，先释放旧的 matcher 并强制 GC 回收。
+	// 避免新旧 matcher 并存导致的内存峰值（旧 ~60MB + 新 ~60MB > OOM 阈值）。
+	p.mu.Lock()
+	p.allowMatcher = nil
+	p.denyMatcher = nil
+	p.mu.Unlock()
+	coremain.ForceGC()
+
 	// 构建新的 Matcher (用于本插件的原有功能)
 	newAllowMatcher := domain.NewDomainMixMatcher()
 	newDenyMatcher := domain.NewDomainMixMatcher()
+	// 同时收集黑名单规则串到缓存，供 GetRules 复用（避免 domain_mapper rebuild 重复解析）
+	denyCollector := &ruleCollector{rules: make([]string, 0, 100000)}
 	totalRuleCount := 0
 
 	for _, rule := range enabledRules {
@@ -402,8 +445,8 @@ func (p *AdguardRule) reloadAllRules(ctx context.Context, initialLoad bool) {
 			continue
 		}
 
-		// 这里传入 Matcher，保持原功能不变
-		count, err := parseRules(file, newAllowMatcher, newDenyMatcher)
+		// 这里传入 Matcher，保持原功能不变；同时收集 deny 规则到缓存
+		count, err := parseRules(file, newAllowMatcher, dualCollector{matcher: newDenyMatcher, collector: denyCollector})
 		file.Close() // 确保文件句柄被关闭
 
 		if err != nil {
@@ -415,12 +458,15 @@ func (p *AdguardRule) reloadAllRules(ctx context.Context, initialLoad bool) {
 	p.mu.Lock()
 	p.allowMatcher = newAllowMatcher
 	p.denyMatcher = newDenyMatcher
+	p.cachedDenyRules = denyCollector.rules
 	p.mu.Unlock()
 
 	log.Printf("[adguard_rule] finished reloading. Total active rules from enabled lists: %d", totalRuleCount)
 
 	newAllowMatcher = nil
 	newDenyMatcher = nil
+	// 强制 GC：回收构建过程中产生的临时对象，降低后续内存峰值
+	coremain.ForceGC()
 
 	// [关键]: 更新完成后，通知所有订阅者 (如 domain_mapper)
 	// 因为 Add/Delete/Enable/Disable/Update 最终都会走到这里，所以都能触发通知

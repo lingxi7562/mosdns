@@ -312,6 +312,9 @@ func NewMapper(bp *coremain.BP, args any) (any, error) {
 		pool = nil
 		hotEntries = nil
 
+		// [内存优化] 重建完成，强制 GC 回收临时 map 与旧 matcher 的内存
+		coremain.ForceGC()
+
 		go func() {
 			time.Sleep(3 * time.Second)
 			coremain.ManualGC()
