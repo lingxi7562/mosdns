@@ -69,9 +69,21 @@ type DomainMapper struct {
 	defaultCtxMark uint32
 	defaultTag     string
 	providers      map[string]data_provider.RuleExporter
+	// directMatchers 记录实现了 DomainMatcherProvider 的 provider（如 adguard），
+	// 直接引用其 Match 方法做实时匹配，避免把其海量规则（102K 条）重复展开进 fastMarkMap。
+	directMatchers []directMatcherEntry
 	runBit         uint8
 
 	hotMap sync.Map
+}
+
+// directMatcherEntry 是直接匹配的 provider 引用：匹配命中时附加指定的 mark/tag
+type directMatcherEntry struct {
+	tag        string
+	mark       uint8
+	ctxMark    uint32
+	outputTag  string
+	matcher    domain.Matcher[struct{}]
 }
 
 var _ sequence.Executable = (*DomainMapper)(nil)
@@ -118,6 +130,8 @@ func NewMapper(bp *coremain.BP, args any) (any, error) {
 		dm.logger.Info("rebuilding domain_mapper with logic inheritance...")
 		start := time.Now()
 
+		dm.directMatchers = dm.directMatchers[:0]
+
 		fastMarkMap := make(map[string]uint64)
 		ctxMarkMap := make(map[string]map[uint32]struct{})
 		tagMap := make(map[string]string)
@@ -129,6 +143,23 @@ func NewMapper(bp *coremain.BP, args any) (any, error) {
 			if !ok {
 				continue
 			}
+
+			// [内存优化] 若 provider 实现了 DomainMatcherProvider（自带完整匹配器，如 adguard），
+			// 则直接引用其 Match 方法，不把海量规则（102K 条）展开进 fastMarkMap。
+			// 这样 domain_mapper 无需重复存储同一批规则的字符串 + trie。
+			if mp, ok := provider.(data_provider.DomainMatcherProvider); ok && (ruleCfg.Mark > 0 || ruleCfg.CtxMark > 0) {
+				dm.directMatchers = append(dm.directMatchers, directMatcherEntry{
+					tag:       ruleCfg.Tag,
+					mark:      ruleCfg.Mark,
+					ctxMark:   ruleCfg.CtxMark,
+					outputTag: ruleCfg.OutputTag,
+					matcher:   mp.GetDomainMatcher(),
+				})
+				dm.logger.Info("domain_mapper: using direct matcher for provider",
+					zap.String("tag", ruleCfg.Tag))
+				continue
+			}
+
 			ruleEntries, err := getRuleEntriesFromProvider(ruleCfg, provider)
 			if err != nil {
 				continue
@@ -518,6 +549,22 @@ func (dm *DomainMapper) lookupMatchResult(name string) (*MatchResult, bool) {
 	}
 	if res, ok := matcher.match(name); ok {
 		merged = mergeMatchResult(merged, res)
+	}
+	// [内存优化] 合并 direct matcher（如 adguard）的匹配结果
+	for _, dmc := range dm.directMatchers {
+		if _, matched := dmc.matcher.Match(name); matched {
+			res := &MatchResult{}
+			if dmc.mark > 0 {
+				res.FastMarks = append(res.FastMarks, dmc.mark)
+			}
+			if dmc.ctxMark > 0 {
+				res.CtxMarks = append(res.CtxMarks, dmc.ctxMark)
+			}
+			if dmc.outputTag != "" {
+				res.JoinedTags = dmc.outputTag
+			}
+			merged = mergeMatchResult(merged, res)
+		}
 	}
 	return merged, merged != nil
 }
