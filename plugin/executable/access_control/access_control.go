@@ -63,6 +63,11 @@ type AccessControl struct {
 	mu   sync.RWMutex
 	cfg  Config
 	apps map[string]*AppEntry
+
+	// [负载优化] Apply 防抖：合并短时间内的多次 Apply（domain_mapper rebuild 开销大）
+	applyMu     sync.Mutex
+	applyTimer  *time.Timer
+	applyQueued bool
 }
 
 func init() {
@@ -97,7 +102,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	// 启动后延迟应用（等 API 就绪）
 	go func() {
 		time.Sleep(8 * time.Second)
-		ac.Apply()
+		ac.applyNow()
 		// 每分钟检查时段变化
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
@@ -156,8 +161,24 @@ func (ac *AccessControl) shouldApply() bool {
 	}
 }
 
-// Apply 生成 blocklist 内容（系统规则 + 时段内控制规则）并热更新
+// Apply 生成 blocklist 内容（系统规则 + 时段内控制规则）并热更新。
+// 使用防抖：多次连续调用（如 WebUI 勾选+时段同时保存）合并为一次，
+// 避免频繁触发 domain_mapper rebuild（设备 CPU 弱，rebuild 开销大）。
 func (ac *AccessControl) Apply() error {
+	ac.applyMu.Lock()
+	defer ac.applyMu.Unlock()
+	if ac.applyTimer != nil {
+		ac.applyTimer.Stop()
+	}
+	ac.applyTimer = time.AfterFunc(5*time.Second, func() {
+		ac.applyMu.Lock()
+		defer ac.applyMu.Unlock()
+		_ = ac.applyNow()
+	})
+	return nil
+}
+
+func (ac *AccessControl) applyNow() error {
 	ac.mu.RLock()
 	mode := ac.cfg.Mode
 	ac.mu.RUnlock()
