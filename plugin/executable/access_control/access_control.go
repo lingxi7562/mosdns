@@ -162,20 +162,38 @@ func (ac *AccessControl) shouldApply() bool {
 }
 
 // Apply 生成 blocklist 内容（系统规则 + 时段内控制规则）并热更新。
-// 使用防抖：多次连续调用（如 WebUI 勾选+时段同时保存）合并为一次，
-// 避免频繁触发 domain_mapper rebuild（设备 CPU 弱，rebuild 开销大）。
+// 防抖策略：首次调用立即执行（单次操作零延迟），5s 内的后续调用合并
+// 到定时器（WebUI 勾选+时段同时保存只 rebuild 一次）。
 func (ac *AccessControl) Apply() error {
 	ac.applyMu.Lock()
 	defer ac.applyMu.Unlock()
-	if ac.applyTimer != nil {
-		ac.applyTimer.Stop()
+	if ac.applyQueued {
+		// 已有待执行的应用，仅刷新定时器（合并）
+		if ac.applyTimer != nil {
+			ac.applyTimer.Stop()
+		}
+		ac.applyTimer = time.AfterFunc(5*time.Second, ac.runQueued)
+		return nil
 	}
-	ac.applyTimer = time.AfterFunc(5*time.Second, func() {
-		ac.applyMu.Lock()
-		defer ac.applyMu.Unlock()
+	// 首次调用：立即执行
+	ac.applyQueued = true
+	go func() {
+		defer func() {
+			ac.applyMu.Lock()
+			ac.applyQueued = false
+			ac.applyMu.Unlock()
+		}()
 		_ = ac.applyNow()
-	})
+	}()
 	return nil
+}
+
+// runQueued 执行合并后的应用
+func (ac *AccessControl) runQueued() {
+	ac.applyMu.Lock()
+	ac.applyQueued = false
+	ac.applyMu.Unlock()
+	_ = ac.applyNow()
 }
 
 func (ac *AccessControl) applyNow() error {

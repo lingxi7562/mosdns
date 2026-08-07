@@ -41,6 +41,10 @@ func init() {
 type Args struct {
 	Socks5      string `yaml:"socks5,omitempty"`
 	LocalConfig string `yaml:"local_config"`
+	// [重构] BuildMatcher 为 true 时构建真实 Trie 匹配器（DirectMatchCapable），
+	// domain_mapper 走 directMatcher 路径，rebuild 时跳过 8.8 万条展开（加载性能优化）。
+	// 代价：规则常驻内存（8.8 万条约 7MB）。适用于 geosite_cn 等高频大列表。
+	BuildMatcher bool `yaml:"build_matcher"`
 }
 
 type RuleSource struct {
@@ -61,6 +65,10 @@ type SdSetLight struct {
 
 	mu      sync.RWMutex
 	sources map[string]*RuleSource
+
+	// [重构] 真实 Trie 匹配器（BuildMatcher=true 时构建，DirectMatchCapable）
+	buildMatcher bool
+	mixer        *domain.MixMatcher[struct{}]
 
 	localConfigFile string
 	httpClient      *http.Client
@@ -114,6 +122,17 @@ func (c *ruleEntryCollector) Add(s string, _ struct{}) error {
 // [新增] 计数器收集器 (用于 reloadAllRules，只计数不存数据，极度省内存)
 type counterCollector struct {
 	count int
+}
+
+// [重构] 匹配器收集器（BuildMatcher 模式：直接把规则构建进 Trie）
+type matcherCollector struct {
+	mixer *domain.MixMatcher[struct{}]
+	count int
+}
+
+func (c *matcherCollector) Add(s string, _ struct{}) error {
+	c.count++
+	return c.mixer.Add(s, struct{}{})
 }
 
 func (c *counterCollector) Add(_ string, _ struct{}) error {
@@ -268,8 +287,12 @@ func newSdSetLight(bp *coremain.BP, args any) (any, error) {
 		ctx:             ctx,
 		cancel:          cancel,
 		subscribers:     make([]func(), 0),
+		buildMatcher:    cfg.BuildMatcher,
 	}
-	// [优化] 不再初始化 matcher
+	// [重构] BuildMatcher=true 时构建真实 Trie 匹配器（DirectMatchCapable）
+	if p.buildMatcher {
+		p.mixer = domain.NewMixMatcher[struct{}]()
+	}
 
 	if err := p.loadConfig(); err != nil {
 		log.Printf("[%s] failed to load config file: %v. Starting with empty config.", PluginType, err)
@@ -291,12 +314,30 @@ func (p *SdSetLight) Close() error {
 	return nil
 }
 
+// DirectMatchSupported [重构] BuildMatcher 模式下返回 true（走 domain_mapper directMatcher 路径）
+func (p *SdSetLight) DirectMatchSupported() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.buildMatcher && p.mixer != nil
+}
+
 func (p *SdSetLight) GetDomainMatcher() domain.Matcher[struct{}] {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.mixer != nil {
+		return p.mixer
+	}
 	return p
 }
 
-// Match [重要修改] 恒定返回 false
+// Match [修改] BuildMatcher 模式下真实匹配；否则恒定 false（占位）
 func (p *SdSetLight) Match(domainStr string) (value struct{}, ok bool) {
+	p.mu.RLock()
+	m := p.mixer
+	p.mu.RUnlock()
+	if m != nil {
+		return m.Match(domainStr)
+	}
 	return struct{}{}, false
 }
 
@@ -370,6 +411,14 @@ func (p *SdSetLight) saveConfig() error {
 func (p *SdSetLight) reloadAllRules() error {
 	log.Printf("[%s] starting lightweight rule scan (zero-cache mode)...", PluginType)
 
+	// [重构] BuildMatcher 模式：重建 Trie（避免重复 Add）
+	if p.buildMatcher {
+		newMixer := domain.NewMixMatcher[struct{}]()
+		p.mu.Lock()
+		p.mixer = newMixer
+		p.mu.Unlock()
+	}
+
 	p.mu.RLock()
 	sourcesSnapshot := make([]*RuleSource, 0, len(p.sources))
 	for _, src := range p.sources {
@@ -393,7 +442,26 @@ func (p *SdSetLight) reloadAllRules() error {
 			continue
 		}
 
-		// 使用计数器收集器：只计数，不产生任何字符串对象，不产生任何内存压力
+		// [重构] BuildMatcher 模式：直接构建真实 Trie 匹配器（DirectMatchCapable）
+		// 非 BuildMatcher 模式：计数器收集器（只计数，不产生字符串对象，不产生内存压力）
+		if p.buildMatcher {
+			mc := &matcherCollector{mixer: p.mixer}
+			ok, count, _ := tryLoadSRS(f, mc, src.EnableRegexp)
+			f.Close()
+			if !ok {
+				log.Printf("[%s] ERROR: failed to scan SRS file for source '%s'", PluginType, src.Name)
+				continue
+			}
+			p.mu.Lock()
+			if s, ok := p.sources[src.Name]; ok && s.RuleCount != count {
+				s.RuleCount = count
+				rulesCountUpdated = true
+			}
+			p.mu.Unlock()
+			continue
+		}
+
+		// 计数器收集器：只计数，不产生任何字符串对象，不产生任何内存压力
 		counter := &counterCollector{}
 		ok, count, _ := tryLoadSRS(f, counter, src.EnableRegexp) // 确保 tryLoadSRS 已改为 io.Reader 版本
 		f.Close()
