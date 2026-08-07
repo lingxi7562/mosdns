@@ -4,6 +4,7 @@ import { getJSON, postJSON } from './api/http'
 import ConfirmBubbleHost from './components/ConfirmBubbleHost.vue'
 import DataManagementManager from './components/DataManagementManager.vue'
 import ListManager from './components/ListManager.vue'
+import AccessControlPanel from './components/AccessControlPanel.vue'
 import OverviewManager from './components/OverviewManager.vue'
 import QueryManager from './components/QueryManager.vue'
 import RulesManager from './components/RulesManager.vue'
@@ -40,7 +41,8 @@ const querySubTabs = [
 const rulesSubTabs = [
   { id: 'list-mgmt', label: '本地规则' },
   { id: 'diversion', label: '订阅规则' },
-  { id: 'adguard', label: '广告拦截' }
+  { id: 'adguard', label: '广告拦截' },
+  { id: 'access-ctrl', label: '访问控制' }
 ]
 
 const autoRefreshState = ref({
@@ -354,6 +356,7 @@ onBeforeUnmount(() => {
         </div>
         <ListManager v-if="activeRulesSubTab === 'list-mgmt'" />
         <RulesManager v-else-if="activeRulesSubTab === 'diversion'" mode="diversion" />
+        <AccessControlPanel v-else-if="activeRulesSubTab === 'access-ctrl'" />
         <RulesManager v-else mode="adguard" />
       </section>
 
