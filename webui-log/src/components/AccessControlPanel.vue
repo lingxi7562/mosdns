@@ -9,6 +9,9 @@ const mode = ref('hours')
 const controlHours = ref('22:00-07:00')
 const status = ref(null)
 const statusText = ref('未加载')
+const apps = ref([])
+const usingApps = ref(false)
+const appsLoaded = ref(false)
 
 async function load() {
   loading.value = true
@@ -25,9 +28,35 @@ async function load() {
   }
 }
 
+async function loadApps() {
+  if (appsLoaded.value) return
+  try {
+    const s = await getJSON('/plugins/access_control/apps')
+    apps.value = s.apps || []
+    usingApps.value = s.using_apps || false
+    appsLoaded.value = true
+  } catch (e) {
+    console.error('apps load failed', e)
+  }
+}
+
+function appCats() {
+  const cats = []
+  for (const a of apps.value) {
+    if (!cats.includes(a.cat)) cats.push(a.cat)
+  }
+  return cats
+}
+
+function catApps(cat) {
+  return apps.value.filter(a => a.cat === cat)
+}
+
 async function save() {
   saving.value = true
   try {
+    const enabled = apps.value.filter(a => a.enabled).map(a => a.key)
+    await postJSON('/plugins/access_control/apps', { enabled_apps: enabled })
     await postJSON('/plugins/access_control/', { mode: mode.value, control_hours: controlHours.value })
     await load()
     setSuccess('访问控制配置已保存并生效')
@@ -44,7 +73,7 @@ const modeOptions = [
   { value: 'off', label: '关闭', desc: '不屏蔽受控应用（仅保留系统防误解析规则）' }
 ]
 
-onMounted(load)
+onMounted(() => { load(); loadApps() })
 </script>
 
 <template>
@@ -53,6 +82,18 @@ onMounted(load)
       <div class="panel-header">
         <h2>访问控制（家长控制）</h2>
         <span class="panel-status">{{ statusText }}</span>
+      </div>
+
+      <div class="form-row" v-if="usingApps">
+        <label>受控应用（勾选 = 禁止访问，点击「保存并应用」生效）</label>
+        <div v-for="cat in appCats()" :key="cat" class="app-cat">
+          <div class="cat-name">{{ cat }}</div>
+          <label v-for="a in catApps(cat)" :key="a.key" class="app-item">
+            <input type="checkbox" v-model="a.enabled" />
+            <span class="app-name">{{ a.name }}</span>
+            <span class="app-count">{{ a.count }} 域名</span>
+          </label>
+        </div>
       </div>
 
       <div class="form-row">
@@ -98,7 +139,7 @@ onMounted(load)
       </div>
 
       <div class="panel-note">
-        <p>受控内容（短视频/游戏等域名）在「本地规则 → 黑名单」中管理，本页控制其生效模式与时段。</p>
+        <p>勾选受控应用后其域名将加入黑名单（随控制模式/时段生效）；自定义域名可在「本地规则 → 黑名单」中添加。</p>
         <p>命令行方式：<code>manage.sh on / off / status</code>，配置文件 <code>/usr/data/recon/manage.conf</code>。</p>
       </div>
     </div>
@@ -112,6 +153,13 @@ onMounted(load)
 .panel-status { font-size: 12px; color: #888; }
 .form-row { margin-bottom: 16px; }
 .form-row label { display: block; font-weight: 600; margin-bottom: 6px; font-size: 13px; }
+.app-cat { margin-bottom: 10px; }
+.cat-name { font-size: 13px; font-weight: 700; color: #555; margin: 8px 0 4px; }
+.app-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; cursor: pointer; font-weight: 400; font-size: 13px; }
+.app-item:hover { background: #f7f9fc; }
+.app-item input { accent-color: #4a90d9; }
+.app-name { min-width: 90px; }
+.app-count { font-size: 11px; color: #999; }
 .mode-list { display: flex; flex-direction: column; gap: 8px; }
 .mode-item { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; padding: 8px 10px; border: 1px solid #ddd; border-radius: 6px; }
 .mode-item:has(input:checked) { border-color: #4a90d9; background: #f0f6ff; }

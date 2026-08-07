@@ -39,19 +39,30 @@ type Args struct {
 	BlocklistFile string `yaml:"blocklist_file"`
 	// blocklist 插件的 API tag（用于热更新，默认 blocklist）
 	BlocklistTag string `yaml:"blocklist_tag"`
+	// 应用库文件（结构化应用→域名清单，勾选管理）
+	AppsFile string `yaml:"apps_file"`
 	// mosdns API 地址（热更新自调用）
 	ApiAddr string `yaml:"api_addr"`
 }
 
 type Config struct {
-	Mode          string `json:"mode"`
-	ControlHours  string `json:"control_hours"`
+	Mode         string   `json:"mode"`
+	ControlHours string   `json:"control_hours"`
+	EnabledApps  []string `json:"enabled_apps"`
+}
+
+// 应用库条目（apps.json 结构）
+type AppEntry struct {
+	Name    string   `json:"name"`
+	Cat     string   `json:"cat"`
+	Domains []string `json:"domains"`
 }
 
 type AccessControl struct {
 	args *Args
 	mu   sync.RWMutex
 	cfg  Config
+	apps map[string]*AppEntry
 }
 
 func init() {
@@ -66,12 +77,21 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	if a.ApiAddr == "" {
 		a.ApiAddr = "127.0.0.1:9099"
 	}
-	ac := &AccessControl{args: a}
+	ac := &AccessControl{args: a, apps: make(map[string]*AppEntry)}
 
 	// 加载持久化配置（无则默认 hours 22:00-07:00）
 	if err := ac.loadConfig(); err != nil {
 		log.Printf("[access_control] config load failed: %v, use defaults", err)
 		ac.cfg = Config{Mode: "hours", ControlHours: "22:00-07:00"}
+	}
+	// 加载应用库；新部署默认启用全部应用（等价旧 ctrl 规则行为）
+	if err := ac.loadApps(); err != nil {
+		log.Printf("[access_control] apps load failed: %v, fallback to ctrl file", err)
+	} else if len(ac.cfg.EnabledApps) == 0 {
+		for k := range ac.apps {
+			ac.cfg.EnabledApps = append(ac.cfg.EnabledApps, k)
+		}
+		_ = ac.saveConfig()
 	}
 
 	// 启动后延迟应用（等 API 就绪）
@@ -148,8 +168,24 @@ func (ac *AccessControl) Apply() error {
 		rules = append(rules, sysRules...)
 	}
 	if apply {
-		if ctrlRules, err := readLines(ac.args.CtrlRulesFile); err == nil {
-			rules = append(rules, ctrlRules...)
+		if len(ac.apps) > 0 {
+			// 应用库模式：展开启用应用的域名（domain: 前缀）
+			ac.mu.RLock()
+			enabled := ac.cfg.EnabledApps
+			apps := ac.apps
+			ac.mu.RUnlock()
+			for _, key := range enabled {
+				if app, ok := apps[key]; ok {
+					for _, d := range app.Domains {
+						rules = append(rules, "domain:"+d)
+					}
+				}
+			}
+		} else {
+			// fallback：平铺 ctrl 文件（无 apps.json 场景）
+			if ctrlRules, err := readLines(ac.args.CtrlRulesFile); err == nil {
+				rules = append(rules, ctrlRules...)
+			}
 		}
 	}
 
@@ -168,7 +204,32 @@ func (ac *AccessControl) Apply() error {
 		return err
 	}
 	resp.Body.Close()
+	// 清 DNS 缓存，避免旧缓存继续返回（cache_all 持久化 3 天 TTL）
+	flushURL := fmt.Sprintf("http://%s/plugins/cache_all/flush", ac.args.ApiAddr)
+	if fr, ferr := http.Post(flushURL, "application/json", nil); ferr == nil {
+		fr.Body.Close()
+	} else {
+		log.Printf("[access_control] ERROR flush cache: %v", ferr)
+	}
 	log.Printf("[access_control] applied: mode=%s in_hours=%v rules=%d", mode, ac.inHoursNow(), len(rules))
+	return nil
+}
+
+func (ac *AccessControl) loadApps() error {
+	data, err := os.ReadFile(ac.args.AppsFile)
+	if err != nil {
+		return err
+	}
+	var lib struct {
+		Apps map[string]*AppEntry `json:"apps"`
+	}
+	if err := json.Unmarshal(data, &lib); err != nil {
+		return err
+	}
+	if len(lib.Apps) == 0 {
+		return fmt.Errorf("empty apps lib")
+	}
+	ac.apps = lib.Apps
 	return nil
 }
 
@@ -210,11 +271,66 @@ func (ac *AccessControl) status() map[string]any {
 		"now":           time.Now().In(beijingTZ).Format("15:04"),
 		"in_hours":      inHours,
 		"applying":      applyNow,
+		"enabled_count": len(ac.cfg.EnabledApps),
 	}
 }
 
 func (ac *AccessControl) api() *chi.Mux {
 	r := chi.NewRouter()
+	// 应用勾选管理
+	r.Route("/apps", func(r chi.Router) {
+		r.Get("/", func(w http.ResponseWriter, req *http.Request) {
+			ac.mu.RLock()
+			apps := ac.apps
+			enabled := ac.cfg.EnabledApps
+			ac.mu.RUnlock()
+			type appView struct {
+				Key     string   `json:"key"`
+				Name    string   `json:"name"`
+				Cat     string   `json:"cat"`
+				Domains []string `json:"domains"`
+				Enabled bool     `json:"enabled"`
+				Count   int      `json:"count"`
+			}
+			enabledSet := make(map[string]bool, len(enabled))
+			for _, k := range enabled {
+				enabledSet[k] = true
+			}
+			list := make([]appView, 0, len(apps))
+			for k, app := range apps {
+				list = append(list, appView{
+					Key: k, Name: app.Name, Cat: app.Cat,
+					Domains: app.Domains, Enabled: enabledSet[k],
+					Count: len(app.Domains),
+				})
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"using_apps":  len(apps) > 0,
+				"enabled_apps": enabled,
+				"apps":        list,
+			})
+		})
+		r.Post("/", func(w http.ResponseWriter, req *http.Request) {
+			var body struct {
+				EnabledApps []string `json:"enabled_apps"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				http.Error(w, "invalid JSON", http.StatusBadRequest)
+				return
+			}
+			ac.mu.Lock()
+			ac.cfg.EnabledApps = body.EnabledApps
+			ac.mu.Unlock()
+			_ = ac.saveConfig()
+			if err := ac.Apply(); err != nil {
+				http.Error(w, "apply failed: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(ac.status())
+		})
+	})
 	r.Get("/", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(ac.status())
