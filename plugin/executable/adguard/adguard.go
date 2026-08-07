@@ -298,6 +298,10 @@ func (p *AdguardRule) triggerReload(ctx context.Context) {
 	})
 }
 
+// DirectMatchSupported 实现 data_provider.DirectMatchCapable：adguard 自带完整匹配器，
+// 允许 domain_mapper 直接引用其 Match 做实时匹配（避免 102K 条规则重复展开）。
+func (p *AdguardRule) DirectMatchSupported() bool { return true }
+
 // GetDomainMatcher 实现了 data_provider.DomainMatcherProvider 接口
 func (p *AdguardRule) GetDomainMatcher() domain.Matcher[struct{}] {
 	return p

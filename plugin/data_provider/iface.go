@@ -28,6 +28,14 @@ type DomainMatcherProvider interface {
 	GetDomainMatcher() domain.Matcher[struct{}]
 }
 
+// DirectMatchCapable 由"自带完整可用匹配器"的 provider 实现（如 adguard）。
+// domain_set_light/sd_set_light 等 light 实现的 Match 是占位实现（恒定返回 false，
+// 匹配依赖 domain_mapper 的规则展开），绝不能走 directMatcher 路径，否则其规则全部失效。
+type DirectMatchCapable interface {
+	DomainMatcherProvider
+	DirectMatchSupported() bool
+}
+
 type IPMatcherProvider interface {
 	GetIPMatcher() netlist.Matcher
 }

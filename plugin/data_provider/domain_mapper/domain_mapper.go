@@ -144,10 +144,11 @@ func NewMapper(bp *coremain.BP, args any) (any, error) {
 				continue
 			}
 
-			// [内存优化] 若 provider 实现了 DomainMatcherProvider（自带完整匹配器，如 adguard），
-			// 则直接引用其 Match 方法，不把海量规则（102K 条）展开进 fastMarkMap。
-			// 这样 domain_mapper 无需重复存储同一批规则的字符串 + trie。
-			if mp, ok := provider.(data_provider.DomainMatcherProvider); ok && (ruleCfg.Mark > 0 || ruleCfg.CtxMark > 0) {
+			// [内存优化] 仅对"自带完整可用匹配器"的 provider（如 adguard，实现 DirectMatchCapable）
+			// 直接引用其 Match 方法，不把海量规则（102K 条）展开进 fastMarkMap。
+			// 注意：domain_set_light/sd_set_light 虽实现 DomainMatcherProvider，但其 Match 是
+			// 占位实现（恒定 false），必须走下面的规则展开路径（v2 曾误判导致 blocklist/geosite 全失效）。
+			if mp, ok := provider.(data_provider.DirectMatchCapable); ok && mp.DirectMatchSupported() && (ruleCfg.Mark > 0 || ruleCfg.CtxMark > 0) {
 				dm.directMatchers = append(dm.directMatchers, directMatcherEntry{
 					tag:       ruleCfg.Tag,
 					mark:      ruleCfg.Mark,
