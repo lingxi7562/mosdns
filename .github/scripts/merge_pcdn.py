@@ -103,7 +103,7 @@ def main():
 
     header = [
         "# PCDN merged rules (auto-generated)",
-        f"# Generated: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        f"# Generated: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d')} UTC",  # 日期级，同一天幂等避免重复 push
         f"# Sources: {', '.join(s[0] for s in SOURCES)}",
         f"# Domains: {len(all_domains)}, Regexes: {len(all_regexes)}",
         "# Format: AdGuard Home (mosdns adguard_rule)",
