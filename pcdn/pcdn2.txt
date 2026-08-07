@@ -1,7 +1,7 @@
 # PCDN merged rules (auto-generated)
 # Generated: 2026-08-07 UTC
-# Sources: susetao/PCDNFilter-CHN-, 4fuu/AdGuard-Home-PCDN, anti-AD discretion/pcdn.txt, thhbdd/Block-pcdn-domains
-# Domains: 40, Regexes: 7
+# Sources: susetao/PCDNFilter-CHN-, 4fuu/AdGuard-Home-PCDN, anti-AD discretion/pcdn.txt, thhbdd/Block-pcdn-domains + static
+# Domains: 40, Regexes: 7, Static: 1
 # Format: AdGuard Home (mosdns adguard_rule)
 ||bsccdn.net^
 ||dyp2p-ali.douyucdn.cn^
@@ -35,6 +35,7 @@
 ||pis-cnc-pcdn.cp31.ott.cibntv.net^
 ||pkoplink.com^
 ||saxysec.com^
+||sjlwql.top^
 ||stun.douyucdn.cn^
 ||stun.hitv.com^
 ||stun1.douyucdn.cn^

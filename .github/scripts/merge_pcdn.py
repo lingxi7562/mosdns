@@ -34,6 +34,10 @@ SOURCES = [
 TIMEOUT = 30
 HEADERS = {"User-Agent": "pcdn-merge-bot/1.0"}
 
+# 静态防御规则（每次合并都会保留，不会被上游覆盖）
+# sjlwql.top: 已注销的远控 C2 域名，防复活后被他人注册利用
+EXTRA_DOMAINS = {"sjlwql.top"}
+
 
 def fetch(url):
     """下载单个 URL，返回文本或 None"""
@@ -104,10 +108,11 @@ def main():
     header = [
         "# PCDN merged rules (auto-generated)",
         f"# Generated: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d')} UTC",  # 日期级，同一天幂等避免重复 push
-        f"# Sources: {', '.join(s[0] for s in SOURCES)}",
-        f"# Domains: {len(all_domains)}, Regexes: {len(all_regexes)}",
+        f"# Sources: {', '.join(s[0] for s in SOURCES)} + static",
+        f"# Domains: {len(all_domains)}, Regexes: {len(all_regexes)}, Static: {len(EXTRA_DOMAINS)}",
         "# Format: AdGuard Home (mosdns adguard_rule)",
     ]
+    all_domains |= EXTRA_DOMAINS
     lines = header + [f"||{d}^" for d in sorted(all_domains)] + sorted(all_regexes) + [""]
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
