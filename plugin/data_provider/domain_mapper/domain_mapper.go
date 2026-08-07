@@ -65,6 +65,10 @@ type DomainMapper struct {
 	matcher        atomic.Value
 	updateMu       sync.Mutex
 	updateTimer    *time.Timer
+	// [并发安全] rebuildMu 串行化 rebuild 执行体：连续热更新（间隔 < rebuild 耗时）
+	// 时并发 rebuild 会竞争 providerCache map（concurrent map writes panic → 崩溃断网）。
+	// 触发定时器受 updateMu 保护，但 rebuild 执行体必须互斥。
+	rebuildMu sync.Mutex
 	ruleConfigs    []RuleConfig
 	defaultMark    uint8
 	defaultCtxMark uint32
@@ -155,6 +159,8 @@ func NewMapper(bp *coremain.BP, args any) (any, error) {
 	}
 
 	rebuild := func() {
+		dm.rebuildMu.Lock()
+		defer dm.rebuildMu.Unlock()
 		dm.logger.Info("rebuilding domain_mapper with logic inheritance...")
 		start := time.Now()
 

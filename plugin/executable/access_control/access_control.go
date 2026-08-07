@@ -68,6 +68,9 @@ type AccessControl struct {
 	applyMu     sync.Mutex
 	applyTimer  *time.Timer
 	applyQueued bool
+	// [并发安全] applyExecMu 串行化 applyNow：防抖 goroutine 与 runQueued/ticker
+	// 可能并发调用 applyNow（重复 POST blocklist post，幂等但浪费），串行化避免。
+	applyExecMu sync.Mutex
 }
 
 func init() {
@@ -197,6 +200,8 @@ func (ac *AccessControl) runQueued() {
 }
 
 func (ac *AccessControl) applyNow() error {
+	ac.applyExecMu.Lock()
+	defer ac.applyExecMu.Unlock()
 	ac.mu.RLock()
 	mode := ac.cfg.Mode
 	ac.mu.RUnlock()
