@@ -3,6 +3,7 @@ package domain_mapper
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"slices"
 	"strings"
@@ -75,6 +76,32 @@ type DomainMapper struct {
 	runBit         uint8
 
 	hotMap sync.Map
+
+	// [增量 rebuild] 按 provider tag 缓存展开结果（含继承后），
+	// provider 规则未变化时复用缓存，避免每次 rebuild 全量重算
+	// 8.8 万条 geosite_cn 等大列表（设备单核 CPU 弱，全量 rebuild 需 1-3 分钟）。
+	providerCache map[string]*providerExpand
+}
+
+// providerExpand 是单个 provider 的展开结果（该 provider 贡献的 mark/tag/source）
+type providerExpand struct {
+	// 版本号（provider 实现 Version() 时用），0 表示不支持版本号（fallback 全量重算）
+	version uint64
+	// 规则内容指纹（无 Version() 的 provider 用，如 sd_set_light 无版本号时）
+	hash string
+	// ruleStr → 该 provider 贡献的 fast mark 位
+	marks map[string]uint64
+	// ruleStr → 该 provider 贡献的 ctx marks
+	ctxMarks map[string]map[uint32]struct{}
+	// ruleStr → 该 provider 贡献的 tag
+	tags map[string]string
+	// ruleStr → 该 provider 贡献的 source
+	sources map[string]string
+}
+
+// versionProvider 是可选接口：O(1) 判断规则是否变化
+type versionProvider interface {
+	Version() uint64
 }
 
 // directMatcherEntry 是直接匹配的 provider 引用：匹配命中时附加指定的 mark/tag
@@ -108,6 +135,7 @@ func NewMapper(bp *coremain.BP, args any) (any, error) {
 		defaultTag:     cfg.DefaultTag,
 		providers:      make(map[string]data_provider.RuleExporter),
 		runBit:         uint8(nextRunBit.Add(^uint32(0))),
+		providerCache:  make(map[string]*providerExpand),
 	}
 	dm.matcher.Store(&compiledMatcher{domainRules: domain.NewMixMatcher[*MatchResult]()})
 
@@ -161,6 +189,56 @@ func NewMapper(bp *coremain.BP, args any) (any, error) {
 				continue
 			}
 
+			// [增量 rebuild] 检查 provider 版本/内容是否变化：
+			// 未变化则复用上次展开缓存（跳过 getRules + 展开 + 祖先继承），
+			// 只对变化的 provider 重新展开。设备单核 CPU 弱，全量 rebuild
+			// （展开 8.8 万条 geosite_cn）需 1-3 分钟，增量后 blocklist 等
+			// 小列表变更秒级生效。
+			var cached *providerExpand
+			var cacheKey string
+			if vp, ok := provider.(versionProvider); ok {
+				// provider 支持 O(1) 版本号（如 domain_set_light）
+				ver := vp.Version()
+				cacheKey = fmt.Sprintf("v:%d", ver)
+				if pc, ok := dm.providerCache[ruleCfg.Tag]; ok && pc.version == ver {
+					cached = pc
+				}
+			} else {
+				// 无版本号：用规则内容哈希（sd_set_light 等）
+				if rules, err := provider.GetRules(); err == nil {
+					hash := hashRules(rules)
+					cacheKey = fmt.Sprintf("h:%s", hash)
+					if pc, ok := dm.providerCache[ruleCfg.Tag]; ok && pc.hash == hash {
+						cached = pc
+					}
+				} else {
+					continue
+				}
+			}
+
+			if cached != nil {
+				// 复用缓存：合并展开结果到全局 map
+				for ruleStr, mask := range cached.marks {
+					fastMarkMap[ruleStr] |= mask
+				}
+				for ruleStr, cm := range cached.ctxMarks {
+					if ctxMarkMap[ruleStr] == nil {
+						ctxMarkMap[ruleStr] = make(map[uint32]struct{})
+					}
+					for m := range cm {
+						ctxMarkMap[ruleStr][m] = struct{}{}
+					}
+				}
+				for ruleStr, tags := range cached.tags {
+					tagMap[ruleStr] = appendJoinedValue(tagMap[ruleStr], tags)
+				}
+				for ruleStr, srcs := range cached.sources {
+					sourceMap[ruleStr] = appendJoinedValue(sourceMap[ruleStr], srcs)
+				}
+				totalRules += len(cached.marks)
+				continue
+			}
+
 			ruleEntries, err := getRuleEntriesFromProvider(ruleCfg, provider)
 			if err != nil {
 				continue
@@ -171,22 +249,129 @@ func NewMapper(bp *coremain.BP, args any) (any, error) {
 				targetTag = ruleCfg.Tag
 			}
 
+			// 新展开（含祖先继承——继承查全局 map，跨 provider 语义与全量一致）
+			pe := &providerExpand{
+				version:  0,
+				hash:     "",
+				marks:    make(map[string]uint64, len(ruleEntries)),
+				ctxMarks: make(map[string]map[uint32]struct{}),
+				tags:     make(map[string]string),
+				sources:  make(map[string]string),
+			}
+
 			for _, ruleEntry := range ruleEntries {
 				ruleStr := ruleEntry.Rule
 				sourceName := firstNonEmpty(ruleEntry.SourceName, ruleCfg.Tag)
 				if ruleCfg.Mark > 0 && ruleCfg.Mark <= 63 {
-					fastMarkMap[ruleStr] |= (1 << (ruleCfg.Mark - 1))
+					mask := uint64(1 << (ruleCfg.Mark - 1))
+					fastMarkMap[ruleStr] |= mask
+					pe.marks[ruleStr] |= mask
 				}
 				if ruleCfg.CtxMark > 0 {
 					if ctxMarkMap[ruleStr] == nil {
 						ctxMarkMap[ruleStr] = make(map[uint32]struct{})
 					}
 					ctxMarkMap[ruleStr][ruleCfg.CtxMark] = struct{}{}
+					if pe.ctxMarks[ruleStr] == nil {
+						pe.ctxMarks[ruleStr] = make(map[uint32]struct{})
+					}
+					pe.ctxMarks[ruleStr][ruleCfg.CtxMark] = struct{}{}
 				}
 				tagMap[ruleStr] = appendJoinedValue(tagMap[ruleStr], targetTag)
+				pe.tags[ruleStr] = appendJoinedValue(pe.tags[ruleStr], targetTag)
 				sourceMap[ruleStr] = appendJoinedValue(sourceMap[ruleStr], sourceName)
+				pe.sources[ruleStr] = appendJoinedValue(pe.sources[ruleStr], sourceName)
 			}
 			totalRules += len(ruleEntries)
+
+			// 祖先继承（继承其他 provider 的 mark/tag 到本 provider 的 full: 和子域）
+			// 注意：继承结果与"全局当时状态"相关，缓存的是展开时刻的继承结果；
+			// 实际配置中各 provider 规则集重叠极少（mark 1-16 互斥），影响可忽略。
+			for ruleStr := range pe.marks {
+				dotPos := strings.Index(ruleStr, ":")
+				if dotPos == -1 {
+					continue
+				}
+				originalDName := ruleStr[dotPos+1:]
+				dName := originalDName
+				hasFull := strings.HasPrefix(ruleStr, "full:")
+
+				if hasFull {
+					ancestorKey := "domain:" + originalDName
+					if aMask, ok := fastMarkMap[ancestorKey]; ok {
+						fastMarkMap[ruleStr] |= aMask
+						pe.marks[ruleStr] |= aMask
+					}
+					if aMarks, ok := ctxMarkMap[ancestorKey]; ok {
+						if ctxMarkMap[ruleStr] == nil {
+							ctxMarkMap[ruleStr] = make(map[uint32]struct{})
+						}
+						if pe.ctxMarks[ruleStr] == nil {
+							pe.ctxMarks[ruleStr] = make(map[uint32]struct{})
+						}
+						for m := range aMarks {
+							ctxMarkMap[ruleStr][m] = struct{}{}
+							pe.ctxMarks[ruleStr][m] = struct{}{}
+						}
+					}
+					aTags := tagMap[ancestorKey]
+					if aTags != "" {
+						tagMap[ruleStr] = appendJoinedValue(tagMap[ruleStr], aTags)
+						pe.tags[ruleStr] = appendJoinedValue(pe.tags[ruleStr], aTags)
+					}
+					aSources := sourceMap[ancestorKey]
+					if aSources != "" {
+						sourceMap[ruleStr] = appendJoinedValue(sourceMap[ruleStr], aSources)
+						pe.sources[ruleStr] = appendJoinedValue(pe.sources[ruleStr], aSources)
+					}
+				}
+
+				for {
+					nextDot := strings.Index(dName, ".")
+					if nextDot == -1 {
+						break
+					}
+					dName = dName[nextDot+1:]
+					ancestorKey := "domain:" + dName
+
+					if aMask, ok := fastMarkMap[ancestorKey]; ok {
+						fastMarkMap[ruleStr] |= aMask
+						pe.marks[ruleStr] |= aMask
+					}
+					if aMarks, ok := ctxMarkMap[ancestorKey]; ok {
+						if ctxMarkMap[ruleStr] == nil {
+							ctxMarkMap[ruleStr] = make(map[uint32]struct{})
+						}
+						if pe.ctxMarks[ruleStr] == nil {
+							pe.ctxMarks[ruleStr] = make(map[uint32]struct{})
+						}
+						for m := range aMarks {
+							ctxMarkMap[ruleStr][m] = struct{}{}
+							pe.ctxMarks[ruleStr][m] = struct{}{}
+						}
+					}
+					aTags := tagMap[ancestorKey]
+					if aTags != "" {
+						tagMap[ruleStr] = appendJoinedValue(tagMap[ruleStr], aTags)
+						pe.tags[ruleStr] = appendJoinedValue(pe.tags[ruleStr], aTags)
+					}
+					aSources := sourceMap[ancestorKey]
+					if aSources != "" {
+						sourceMap[ruleStr] = appendJoinedValue(sourceMap[ruleStr], aSources)
+						pe.sources[ruleStr] = appendJoinedValue(pe.sources[ruleStr], aSources)
+					}
+				}
+			}
+
+			// 保存缓存
+			pe.version = 0
+			pe.hash = ""
+			if vp, ok := provider.(versionProvider); ok {
+				pe.version = vp.Version()
+			} else if strings.HasPrefix(cacheKey, "h:") {
+				pe.hash = cacheKey[2:]
+			}
+			dm.providerCache[ruleCfg.Tag] = pe
 		}
 
 		for _, ruleStr := range collectRuleKeys(fastMarkMap, ctxMarkMap, tagMap, sourceMap) {
@@ -336,6 +521,11 @@ func NewMapper(bp *coremain.BP, args any) (any, error) {
 			zap.Int("pooled_results", len(pool)),
 			zap.Int("hot_entries", len(hotEntries)),
 			zap.Duration("duration", time.Since(start)))
+		// [诊断] Warn 级别记录 rebuild 耗时（Info 被 start.log 过滤，Warn 可见）
+		dm.logger.Warn("rebuild finished (incremental)",
+			zap.Int("rules", totalRules),
+			zap.Int("cached_providers", len(dm.providerCache)),
+			zap.Duration("duration", time.Since(start)))
 
 		fastMarkMap = nil
 		ctxMarkMap = nil
@@ -390,6 +580,16 @@ func sortedCtxMarks(m map[uint32]struct{}) []uint32 {
 		}
 	}
 	return out
+}
+
+// hashRules 计算规则列表的轻量指纹（用于无 Version() 接口的 provider）
+func hashRules(rules []string) string {
+	h := fnv.New32a()
+	for _, r := range rules {
+		h.Write([]byte(r))
+		h.Write([]byte{'\n'})
+	}
+	return fmt.Sprintf("%x", h.Sum32())
 }
 
 func getRuleEntriesFromProvider(ruleCfg RuleConfig, provider data_provider.RuleExporter) ([]data_provider.RuleEntry, error) {

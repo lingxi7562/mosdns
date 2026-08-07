@@ -68,6 +68,7 @@ type DomainSetLight struct {
 
 	ruleFile string
 	rules    []string // 仅维护字符串列表，内存占用极低
+	version  uint64   // [增量rebuild] 规则版本号，每次变更递增
 
 	// 新增：订阅者列表
 	subscribers []func()
@@ -81,6 +82,13 @@ func (d *DomainSetLight) GetRules() ([]string, error) {
 	rulesCopy := make([]string, len(d.rules))
 	copy(rulesCopy, d.rules)
 	return rulesCopy, nil
+}
+
+// Version 返回规则版本号（增量 rebuild 用，O(1) 判断规则是否变化）
+func (d *DomainSetLight) Version() uint64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.version
 }
 
 // Subscribe 实现 RuleExporter 接口
@@ -277,6 +285,7 @@ func (d *DomainSetLight) api() *chi.Mux {
 		// [优化] 直接替换 slice，无需重建 Trie
 		d.mu.Lock()
 		d.rules = p.Values
+		d.version++
 		d.mu.Unlock()
 
 		if err := writeRulesToFile(d.ruleFile, d.rules); err != nil {

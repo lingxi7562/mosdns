@@ -22,12 +22,16 @@ package hosts
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/hosts"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
+	"github.com/go-chi/chi/v5"
 	"github.com/miekg/dns"
 	"os"
 )
@@ -47,10 +51,52 @@ type Args struct {
 
 type Hosts struct {
 	h *hosts.Hosts
+	// [热更新] 保存当前 entries（POST /post 重建用）
+	entries []string
 }
 
-func Init(_ *coremain.BP, args any) (any, error) {
-	return NewHosts(args.(*Args))
+func Init(bp *coremain.BP, args any) (any, error) {
+	h, err := NewHosts(args.(*Args))
+	if err != nil {
+		return nil, err
+	}
+	// [热更新] 注册 API：POST /plugins/{tag}/post 替换 entries（免重启）
+	bp.RegAPI(h.api())
+	return h, nil
+}
+
+// rebuild 用 entries 重建匹配器（热更新）
+func (h *Hosts) rebuild(entries []string) error {
+	m := domain.NewMixMatcher[*hosts.IPs]()
+	m.SetDefaultMatcher(domain.MatcherFull)
+	for i, entry := range entries {
+		if err := domain.Load[*hosts.IPs](m, entry, hosts.ParseIPs); err != nil {
+			return fmt.Errorf("failed to load entry #%d %s, %w", i, entry, err)
+		}
+	}
+	h.h = hosts.NewHosts(m)
+	h.entries = entries
+	return nil
+}
+
+func (h *Hosts) api() *chi.Mux {
+	r := chi.NewRouter()
+	r.Post("/post", func(w http.ResponseWriter, req *http.Request) {
+		var body struct {
+			Values []string `json:"values"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if err := h.rebuild(body.Values); err != nil {
+			http.Error(w, "rebuild failed: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "hosts replaced with %d entries", len(body.Values))
+	})
+	return r
 }
 
 func NewHosts(args *Args) (*Hosts, error) {
@@ -72,7 +118,8 @@ func NewHosts(args *Args) (*Hosts, error) {
 	}
 
 	return &Hosts{
-		h: hosts.NewHosts(m),
+		h:       hosts.NewHosts(m),
+		entries: append([]string(nil), args.Entries...),
 	}, nil
 }
 

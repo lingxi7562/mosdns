@@ -69,6 +69,7 @@ type SdSetLight struct {
 
 	subscribers []func()
 	subsMu      sync.RWMutex
+	version     uint64 // [增量rebuild] 规则版本号，notifySubscribers 时递增
 }
 
 var _ data_provider.DomainMatcherProvider = (*SdSetLight)(nil)
@@ -128,6 +129,13 @@ func (p *SdSetLight) Subscribe(cb func()) {
 }
 
 // 2. 修改 GetRules：改为实时流式读取，不留驻留内存
+// Version 返回规则版本号（增量 rebuild 用，O(1) 判断；避免每次 rebuild 重读大文件）
+func (p *SdSetLight) Version() uint64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.version
+}
+
 func (p *SdSetLight) GetRules() ([]string, error) {
 	p.mu.RLock()
 	type srcInfo struct {
@@ -206,6 +214,9 @@ func (p *SdSetLight) GetRuleEntries() ([]data_provider.RuleEntry, error) {
 }
 
 func (p *SdSetLight) notifySubscribers() {
+	p.mu.Lock()
+	p.version++
+	p.mu.Unlock()
 	p.subsMu.RLock()
 	subs := make([]func(), len(p.subscribers))
 	copy(subs, p.subscribers)
