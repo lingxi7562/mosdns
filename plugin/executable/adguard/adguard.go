@@ -148,40 +148,41 @@ func (p *AdguardRule) Subscribe(cb func()) {
 // GetRules 实现 RuleExporter
 // 注意：只导出 Deny (黑名单) 规则，忽略 Allow (白名单) 规则。
 func (p *AdguardRule) GetRules() ([]string, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
 	// [内存优化] 优先返回 reload 时缓存的规则串，避免重复解析文件（102K 条 × 正则编译）
+	// 注意：不能持锁做文件 IO（会与 reloadAllRules 的写锁死锁）
+	p.mu.RLock()
 	if p.cachedDenyRules != nil {
-		return p.cachedDenyRules, nil
+		cached := p.cachedDenyRules
+		p.mu.RUnlock()
+		return cached, nil
 	}
 
-	// 获取所有“已启用”的规则
+	// 获取所有“已启用”的规则（锁内仅取快照）
 	enabledRules := make([]*OnlineRule, 0)
 	for _, rule := range p.onlineRules {
 		if rule.Enabled {
 			enabledRules = append(enabledRules, rule)
 		}
 	}
+	p.mu.RUnlock()
 
-	// 收集黑名单规则
+	// 无锁解析文件（可能较慢，但不阻塞 reload）
 	denyCollector := &ruleCollector{rules: make([]string, 0)}
-	// 忽略白名单规则 (我们不希望把白名单导出给 domain_mapper 进行打标拦截)
 	allowCollector := &noOpCollector{}
-
 	for _, rule := range enabledRules {
 		file, err := os.Open(rule.localPath)
 		if err != nil {
-			// 仅记录日志，不中断其他文件的导出
 			log.Printf("[adguard_rule] GetRules: WARN: skipping enabled rule '%s', cannot open file: %v", rule.Name, err)
 			continue
 		}
-		// 复用 parseRules 逻辑
 		parseRules(file, allowCollector, denyCollector)
 		file.Close()
 	}
 
+	// 写缓存（短锁）
+	p.mu.Lock()
 	p.cachedDenyRules = denyCollector.rules
+	p.mu.Unlock()
 	return denyCollector.rules, nil
 }
 
