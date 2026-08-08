@@ -1,5 +1,5 @@
 # PCDN merged rules (auto-generated)
-# Generated: 2026-08-07 UTC
+# Generated: 2026-08-08 UTC
 # Sources: susetao/PCDNFilter-CHN-, 4fuu/AdGuard-Home-PCDN, anti-AD discretion/pcdn.txt, thhbdd/Block-pcdn-domains + static
 # Domains: 40, Regexes: 7, Static: 1
 # Format: AdGuard Home (mosdns adguard_rule)
