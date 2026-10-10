@@ -614,7 +614,10 @@ func renderSpecialGroupsConfig(groups []SpecialGroup) []byte {
 		b.WriteString("\n")
 	}
 
-	for _, tag := range []string{"sequence_special_v4", "sequence_special_v6", "sequence_special_ot"} {
+	// compat: schema 4+ configs call a single dispatcher named `sequence_special`.
+	// Emit it with the same mark-dispatch body as the legacy v4/v6/ot entries so that
+	// both schema 3 and schema 4+ config packages work on this binary.
+	for _, tag := range []string{"sequence_special_v4", "sequence_special_v6", "sequence_special_ot", "sequence_special"} {
 		b.WriteString(fmt.Sprintf("  - tag: %s\n", tag))
 		b.WriteString("    type: sequence\n")
 		if len(mainFlowGroups) == 0 {

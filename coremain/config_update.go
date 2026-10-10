@@ -362,10 +362,12 @@ func validateConfigUpdateManifest(manifest configUpdateManifest, files map[strin
 	if manifest.Channel != configUpdateChannel {
 		return fmt.Errorf("config package channel %q does not match %q", manifest.Channel, configUpdateChannel)
 	}
-	if manifest.ConfigSchema != requiredSchema {
-		return fmt.Errorf("config package schema %d does not match required schema %d", manifest.ConfigSchema, requiredSchema)
+	// compat: accept newer config packages (schema > required) instead of only the exact one.
+	if manifest.ConfigSchema < requiredSchema {
+		return fmt.Errorf("config package schema %d is older than required schema %d", manifest.ConfigSchema, requiredSchema)
 	}
-	if manifest.PackageID != requiredPackageID {
+	// compat: newer packages are published as main-config-schema-N; accept any of them.
+	if manifest.PackageID != requiredPackageID && !strings.HasPrefix(manifest.PackageID, "main-config-schema-") {
 		return fmt.Errorf("config package id %q does not match required id %q", manifest.PackageID, requiredPackageID)
 	}
 	if len(manifest.ManagedFiles) == 0 {
